@@ -69,7 +69,7 @@ function Log([string]$level, [string]$msg) {
 function Fail([string]$msg) { throw $msg }
 
 function Get-Phone { Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match '^USB\\VID_05AC&PID_12A[0-9A-F]\\[^&]+$' } | Select-Object -First 1 }
-function Get-PhoneAdapter { Get-NetAdapter -IncludeHidden | Where-Object { $_.PnPDeviceID -like 'USB\VID_05AC&PID_12A*' } | Select-Object -First 1 }
+function Get-PhoneAdapter { Get-NetAdapter | Where-Object { $_.PnPDeviceID -like 'USB\VID_05AC&PID_12A*&CDC_0D&MI_02\*' -and $_.Status -ne 'Not Present' } | Select-Object -First 1 }
 # Windows' photo-import (WPD/PTP) driver opens a session on the phone, which makes iOS show
 # "Trust This Computer?" and re-enumerate USB after the answer - that resets the mode mid-sequence.
 # Nothing here needs PTP, so keep that interface disabled. (Re-enable in Device Manager for photo import.)
@@ -131,7 +131,24 @@ function Get-Ics {
     foreach ($c in @($ics.EnumEveryConnection)) { $map[$ics.NetConnectionProps($c).Name] = $ics.INetSharingConfigurationForINetConnection($c) }
     return $map
 }
-function Get-WifiName { (Get-NetAdapter | Where-Object { $_.MediaType -eq 'Native 802.11' -and $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Virtual' } | Select-Object -First 1).Name }
+function Get-WifiName {
+    $adapters = @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface })
+    $interfaces = @{}
+    foreach ($ip in @(Get-NetIPInterface -AddressFamily IPv4)) { $interfaces[$ip.InterfaceIndex] = $ip }
+    $routes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+    $candidates = @(foreach ($route in $routes) {
+        $adapter = $adapters | Where-Object { $_.ifIndex -eq $route.InterfaceIndex } | Select-Object -First 1
+        $ip = $interfaces[$route.InterfaceIndex]
+        if ($adapter -and $ip -and $ip.ConnectionState -eq 'Connected') {
+            [pscustomobject]@{
+                Name = $adapter.Name
+                Metric = [long]$route.RouteMetric + [long]$ip.InterfaceMetric
+                InterfaceIndex = $route.InterfaceIndex
+            }
+        }
+    })
+    ($candidates | Sort-Object Metric, InterfaceIndex | Select-Object -First 1).Name
+}
 function Get-Lease($alias) {
     Get-NetNeighbor -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.IPAddress -like "$Subnet*" -and $_.IPAddress -ne "${Subnet}255" -and $_.IPAddress -ne "${Subnet}1" -and $_.LinkLayerAddress -ne '00-00-00-00-00-00' } |
@@ -204,7 +221,7 @@ function Start-Share {
     Disable-PhotoInterface
     $uplink = Stop-MobileHotspotIfOn
     $wifi = Get-WifiName
-    if (-not $wifi) { Fail 'No connected Wi-Fi adapter to share.' }
+    if (-not $wifi) { Fail 'No connected Ethernet or Wi-Fi adapter with an IPv4 default route to share.' }
     Log INFO "uplink: $wifi ($uplink)"
 
     $adapter = $s.Adapter
